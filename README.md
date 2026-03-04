@@ -90,6 +90,7 @@ Snapshot files (`__snapshots__/*.snap`) are automatically detected and updated v
 | `--project-dir <DIR>` | Subdirectory containing the TS project | `ch-client` |
 | `--max-retries <N>` | Claude fix attempts per check stage | `3` |
 | `--but-path <PATH>` | Path to the `but` CLI | `but` |
+| `-p, --post-commit` | Run as a post-commit hook (auto-detect branch) | - |
 | `-n, --no-commit` | Run checks but skip committing | - |
 | `-v, --verbose` | Show file lists and commands for each stage | - |
 | `--dry-run` | Show what would run without executing | - |
@@ -161,6 +162,36 @@ src/
 ├── process.rs        # Async command runner
 └── ui.rs             # Interactive branch selector (raw terminal)
 ```
+
+## Post-commit Hook
+
+tschecker can run automatically after every `but commit` as a post-commit hook. It detects which branch was just committed to by matching the latest commit hash against GitButler's branch data, then runs the full check pipeline on that branch's changed files.
+
+### Setup
+
+Create a post-commit hook in your repo (use `post-commit-user` if GitButler manages hooks):
+
+```bash
+# .git/hooks/post-commit-user
+#!/bin/bash
+tschecker -p
+```
+
+Make it executable:
+
+```bash
+chmod +x .git/hooks/post-commit-user
+```
+
+### How it works
+
+1. Your commit goes through immediately (non-blocking)
+2. The hook fires and tschecker detects which branch the commit belongs to
+3. Runs all 4 check stages on the branch's changed files
+4. If fixes are needed, commits them as a follow-up (GitButler can squash later)
+5. If fixes fail, logs a warning — your original commit is safe
+
+This is the same pipeline as `tschecker -b <branch>`, just with automatic branch detection.
 
 ## Requirements
 

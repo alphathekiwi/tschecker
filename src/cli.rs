@@ -41,6 +41,10 @@ pub struct Cli {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Run as a post-commit hook (detect branch from last commit, run checks)
+    #[arg(short, long)]
+    pub post_commit: bool,
+
     /// Rebuild and reinstall tschecker from source
     #[arg(long)]
     pub update: bool,

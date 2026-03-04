@@ -119,6 +119,20 @@ pub fn branch_changed_files(status: &ButStatus, branch_name: &str) -> Vec<String
     result
 }
 
+/// Find which branch contains a specific commit hash
+pub fn find_branch_by_commit<'a>(status: &'a ButStatus, commit_hash: &str) -> Option<&'a Branch> {
+    for stack in &status.stacks {
+        for branch in &stack.branches {
+            for commit in &branch.commits {
+                if commit.commit_id.as_deref() == Some(commit_hash) {
+                    return Some(branch);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Filter file paths to a project subdirectory and make them relative to it
 pub fn filter_to_project(files: &[String], project_dir: &str) -> Vec<String> {
     let prefix = format!("{}/", project_dir.trim_end_matches('/'));

@@ -9,7 +9,7 @@ mod ui;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -23,6 +23,10 @@ async fn main() -> Result<()> {
 
     if cli.update {
         return self_update().await;
+    }
+
+    if cli.post_commit {
+        return run_post_commit_mode(&cli).await;
     }
 
     let repo_path = cli.repo_path.canonicalize().context("Invalid repo path")?;
@@ -97,6 +101,67 @@ async fn main() -> Result<()> {
         info!("All branches passed");
     } else {
         std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+async fn run_post_commit_mode(cli: &cli::Cli) -> Result<()> {
+    let repo_path = cli.repo_path.canonicalize().context("Invalid repo path")?;
+    let project_dir = repo_path.join(&cli.project_dir);
+
+    if !project_dir.exists() {
+        anyhow::bail!("Project directory not found: {}", project_dir.display());
+    }
+
+    // Get the last commit hash
+    let log_output = process::run_command("git", &["log", "-1", "--format=%H"], &repo_path).await?;
+    let commit_hash = log_output.stdout.trim().to_string();
+
+    if commit_hash.is_empty() {
+        warn!("No commits found, skipping post-commit checks");
+        return Ok(());
+    }
+
+    info!(commit = %commit_hash, "Post-commit hook triggered");
+
+    // Get GitButler status and find which branch contains this commit
+    let status = gitbutler::get_status(&cli.but_path, &repo_path).await?;
+
+    let branch = match gitbutler::find_branch_by_commit(&status, &commit_hash) {
+        Some(b) => b,
+        None => {
+            info!(commit = %commit_hash, "Commit not found in any GitButler branch, skipping");
+            return Ok(());
+        }
+    };
+
+    info!(branch = %branch.name, "Detected branch from commit");
+
+    let all_files = gitbutler::branch_changed_files(&status, &branch.name);
+    let project_files = gitbutler::filter_to_project(&all_files, &cli.project_dir);
+
+    if project_files.is_empty() {
+        info!(branch = %branch.name, "No files in {} — skipping", cli.project_dir);
+        return Ok(());
+    }
+
+    let config = pipeline::PipelineConfig {
+        project_dir: project_dir.clone(),
+        repo_path: repo_path.clone(),
+        max_retries: cli.max_retries,
+        but_path: cli.but_path.clone(),
+        no_commit: cli.no_commit,
+        dry_run: cli.dry_run,
+        verbose: cli.verbose,
+    };
+
+    let passed = pipeline::run(branch, &project_files, &config).await?;
+
+    if !passed {
+        error!(branch = %branch.name, "Post-commit checks failed — manual fixes needed");
+    } else {
+        info!(branch = %branch.name, "Post-commit checks passed");
     }
 
     Ok(())
