@@ -11,6 +11,7 @@ pub struct PipelineConfig {
     pub max_retries: u32,
     pub but_path: String,
     pub no_commit: bool,
+    pub no_fixes: bool,
     pub dry_run: bool,
     pub verbose: bool,
 }
@@ -21,6 +22,14 @@ pub async fn run(
     config: &PipelineConfig,
 ) -> Result<bool> {
     let project_dir = &config.project_dir;
+
+    // Filter out deleted files (may still appear in GitButler status)
+    let changed_files: Vec<&String> = changed_files
+        .iter()
+        .filter(|f| project_dir.join(f).exists())
+        .collect();
+    let changed_files: Vec<String> = changed_files.into_iter().cloned().collect();
+    let changed_files = changed_files.as_slice();
 
     info!(branch = %branch.name, files = changed_files.len(), "Starting pipeline");
 
@@ -34,6 +43,9 @@ pub async fn run(
         return Ok(true);
     }
 
+    // In --no-fixes mode, collect all errors across stages instead of bailing early
+    let mut failed_stages: Vec<(CheckStage, Vec<String>)> = Vec::new();
+
     // Stage 1: Prettier (deterministic, no Claude)
     let prettier_files = files::filter_by_extensions(changed_files, files::PRETTIER_EXTENSIONS);
     if !prettier_files.is_empty() {
@@ -41,10 +53,15 @@ pub async fn run(
         log_cmd(config.verbose, "./node_modules/.bin/prettier --write", &prettier_files);
         let result = checks::prettier::run(&prettier_files, project_dir).await?;
         if !result.success {
-            error!("Prettier failed: {:?}", result.errors);
-            return Ok(false);
+            if config.no_fixes {
+                failed_stages.push((CheckStage::Prettier, result.errors));
+            } else {
+                error!("Prettier failed: {:?}", result.errors);
+                return Ok(false);
+            }
+        } else {
+            info!(stage = "prettier", "Passed");
         }
-        info!(stage = "prettier", "Passed");
     }
 
     // Stage 2: ESLint (auto-fix, then Claude for remaining)
@@ -53,14 +70,19 @@ pub async fn run(
         info!(stage = "eslint", files = eslint_files.len(), "Running");
         log_cmd(config.verbose, "./node_modules/.bin/eslint --fix --cache --cache-location .cache/eslint/ --quiet", &eslint_files);
         let mut result = checks::eslint::run(&eslint_files, project_dir).await?;
-        if !result.success {
+        if !result.success && !config.no_fixes {
             result = run_fix_loop(CheckStage::Eslint, &eslint_files, &result.errors, config, project_dir).await?;
         }
         if !result.success {
-            error!(branch = %branch.name, "ESLint errors remain after {} retries", config.max_retries);
-            return Ok(false);
+            if config.no_fixes {
+                failed_stages.push((CheckStage::Eslint, result.errors));
+            } else {
+                error!(branch = %branch.name, "ESLint errors remain after fix attempts");
+                return Ok(false);
+            }
+        } else {
+            info!(stage = "eslint", "Passed");
         }
-        info!(stage = "eslint", "Passed");
     }
 
     // Stage 3: TypeScript (full project, filter to changed files, Claude for fixes)
@@ -70,14 +92,19 @@ pub async fn run(
         log_cmd(config.verbose, "./node_modules/.bin/tsc --noEmit --pretty false", &[]);
         log_files(config.verbose, &ts_files);
         let mut result = checks::typescript::run(&ts_files, project_dir).await?;
-        if !result.success {
+        if !result.success && !config.no_fixes {
             result = run_fix_loop(CheckStage::Typescript, &ts_files, &result.errors, config, project_dir).await?;
         }
         if !result.success {
-            error!(branch = %branch.name, "TypeScript errors remain after {} retries", config.max_retries);
-            return Ok(false);
+            if config.no_fixes {
+                failed_stages.push((CheckStage::Typescript, result.errors));
+            } else {
+                error!(branch = %branch.name, "TypeScript errors remain after fix attempts");
+                return Ok(false);
+            }
+        } else {
+            info!(stage = "tsc", "Passed");
         }
-        info!(stage = "tsc", "Passed");
     }
 
     // Stage 4: Vitest (update snapshots, Claude for failures)
@@ -91,14 +118,33 @@ pub async fn run(
         info!(stage = "vitest", files = test_files.len(), "Running");
         log_cmd(config.verbose, "./node_modules/.bin/vitest run --reporter=json -u", &test_files);
         let mut result = checks::vitest::run(&test_files, project_dir).await?;
-        if !result.success {
+        if !result.success && !config.no_fixes {
             result = run_fix_loop(CheckStage::Vitest, &test_files, &result.errors, config, project_dir).await?;
         }
         if !result.success {
-            error!(branch = %branch.name, "Vitest failures remain after {} retries", config.max_retries);
-            return Ok(false);
+            if config.no_fixes {
+                failed_stages.push((CheckStage::Vitest, result.errors));
+            } else {
+                error!(branch = %branch.name, "Vitest failures remain after fix attempts");
+                return Ok(false);
+            }
+        } else {
+            info!(stage = "vitest", "Passed");
         }
-        info!(stage = "vitest", "Passed");
+    }
+
+    // In --no-fixes mode, print all collected errors
+    if !failed_stages.is_empty() {
+        error!(branch = %branch.name, stages = failed_stages.len(), "Errors found (--no-fixes)");
+        for (stage, errors) in &failed_stages {
+            error!(stage = %stage, errors = errors.len(), "Failed");
+            for err in errors {
+                for line in err.lines() {
+                    error!(stage = %stage, "{}", line);
+                }
+            }
+        }
+        return Ok(false);
     }
 
     // All checks passed — commit

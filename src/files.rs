@@ -119,8 +119,8 @@ pub fn collect_test_files(source_files: &[String], project_root: &Path) -> Vec<S
     let mut seen = std::collections::HashSet::new();
 
     for source in source_files {
-        // If the changed file IS a runnable test file, include it directly
-        if is_test_file(source) && seen.insert(source.clone()) {
+        // If the changed file IS a runnable test file, include it directly (if it exists)
+        if is_test_file(source) && project_root.join(source).exists() && seen.insert(source.clone()) {
             test_files.push(source.clone());
             continue;
         }

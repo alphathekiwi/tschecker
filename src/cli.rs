@@ -33,6 +33,10 @@ pub struct Cli {
     #[arg(short, long)]
     pub no_commit: bool,
 
+    /// Skip Claude fix attempts — just report errors
+    #[arg(long)]
+    pub no_fixes: bool,
+
     /// List files for each check stage
     #[arg(short, long)]
     pub verbose: bool,

@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
         max_retries: cli.max_retries,
         but_path: cli.but_path.clone(),
         no_commit: cli.no_commit,
+        no_fixes: cli.no_fixes,
         dry_run: cli.dry_run,
         verbose: cli.verbose,
     };
@@ -157,6 +158,7 @@ async fn run_post_commit_mode(cli: &cli::Cli) -> Result<()> {
         max_retries: cli.max_retries,
         but_path: cli.but_path.clone(),
         no_commit: cli.no_commit,
+        no_fixes: cli.no_fixes,
         dry_run: cli.dry_run,
         verbose: cli.verbose,
     };
