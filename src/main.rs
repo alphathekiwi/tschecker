@@ -114,8 +114,13 @@ async fn run_post_commit_mode(cli: &cli::Cli) -> Result<()> {
         anyhow::bail!("Project directory not found: {}", project_dir.display());
     }
 
-    // Get the last commit hash
-    let log_output = process::run_command("git", &["log", "-1", "--format=%H"], &repo_path).await?;
+    // Get the last real commit hash (skip GitButler's workspace merge commit)
+    let log_output = process::run_command(
+        "git",
+        &["log", "--no-merges", "-1", "--format=%H"],
+        &repo_path,
+    )
+    .await?;
     let commit_hash = log_output.stdout.trim().to_string();
 
     if commit_hash.is_empty() {
