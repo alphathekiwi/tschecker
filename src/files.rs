@@ -71,13 +71,13 @@ pub fn find_test_file(source_path: &str, project_root: &Path) -> Option<PathBuf>
     }
 
     // 4. Mirrored __tests__: src/a/b/Foo.tsx -> src/__tests__/a/b/Foo.test.tsx
-    if let Ok(stripped) = path.strip_prefix("src") {
-        if let Some(rel_parent) = stripped.parent() {
-            for name in &test_filenames {
-                let candidate = Path::new("src/__tests__").join(rel_parent).join(name);
-                if project_root.join(&candidate).exists() {
-                    return Some(candidate);
-                }
+    if let Ok(stripped) = path.strip_prefix("src")
+        && let Some(rel_parent) = stripped.parent()
+    {
+        for name in &test_filenames {
+            let candidate = Path::new("src/__tests__").join(rel_parent).join(name);
+            if project_root.join(&candidate).exists() {
+                return Some(candidate);
             }
         }
     }
