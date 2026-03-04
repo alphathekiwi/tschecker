@@ -7,8 +7,18 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# Get the directory where the script is located
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Ensure we're in the tschecker project directory
+if [[ "$(basename "$PWD")" != "tschecker" ]]; then
+    if [[ -d "$PWD/tschecker" && -f "$PWD/tschecker/Cargo.toml" ]]; then
+        echo -e "${YELLOW}Found tschecker/ in current directory, changing to it${NC}"
+        cd "$PWD/tschecker"
+    else
+        echo -e "${RED}Error: Not in tschecker directory and couldn't find tschecker/Cargo.toml in $PWD${NC}"
+        exit 1
+    fi
+fi
+
+SCRIPT_DIR="$PWD"
 CARGO_TOML="$SCRIPT_DIR/Cargo.toml"
 
 # Check if Cargo.toml exists
