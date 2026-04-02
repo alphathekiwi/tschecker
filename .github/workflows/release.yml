@@ -46,11 +46,6 @@ jobs:
             os: ubuntu-latest
             use-cross: true
 
-          # Windows x86_64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            use-cross: false
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4

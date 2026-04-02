@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
 
 use crate::checks::{self, CheckResult, CheckStage};
-use crate::{claude, files, gitbutler, process};
+use crate::{claude, files, gitbutler, process, ui};
 
 pub struct PipelineConfig {
     pub project_dir: PathBuf,
@@ -14,6 +14,10 @@ pub struct PipelineConfig {
     pub no_fixes: bool,
     pub dry_run: bool,
     pub verbose: bool,
+    /// When true, use plain `git commit` instead of `but commit`
+    pub use_git_commit: bool,
+    /// Run only this stage (None = all stages)
+    pub stage: Option<CheckStage>,
 }
 
 pub async fn run(
@@ -31,10 +35,10 @@ pub async fn run(
     let changed_files: Vec<String> = changed_files.into_iter().cloned().collect();
     let changed_files = changed_files.as_slice();
 
-    info!(branch = %branch.name, files = changed_files.len(), "Starting pipeline");
+    info!(branch = %ui::cyan(&branch.name), files = changed_files.len(), "Starting pipeline");
 
     if changed_files.is_empty() {
-        info!(branch = %branch.name, "No changed files, skipping");
+        info!(branch = %ui::cyan(&branch.name), "No changed files, skipping");
         return Ok(true);
     }
 
@@ -46,17 +50,19 @@ pub async fn run(
     // In --no-fixes mode, collect all errors across stages instead of bailing early
     let mut failed_stages: Vec<(CheckStage, Vec<String>)> = Vec::new();
 
+    let should_run = |stage: CheckStage| config.stage.map_or(true, |s| s == stage);
+
     // Stage 1: Prettier (deterministic, no Claude)
     let prettier_files = files::filter_by_extensions(changed_files, files::PRETTIER_EXTENSIONS);
-    if !prettier_files.is_empty() {
+    if should_run(CheckStage::Prettier) && !prettier_files.is_empty() {
         info!(stage = "prettier", files = prettier_files.len(), "Running");
         log_cmd(config.verbose, "./node_modules/.bin/prettier --write", &prettier_files);
         let result = checks::prettier::run(&prettier_files, project_dir).await?;
         if !result.success {
+            log_stage_errors(CheckStage::Prettier, &result.errors);
             if config.no_fixes {
                 failed_stages.push((CheckStage::Prettier, result.errors));
             } else {
-                error!("Prettier failed: {:?}", result.errors);
                 return Ok(false);
             }
         } else {
@@ -66,7 +72,7 @@ pub async fn run(
 
     // Stage 2: ESLint (auto-fix, then Claude for remaining)
     let eslint_files = files::filter_by_extensions(changed_files, files::ESLINT_EXTENSIONS);
-    if !eslint_files.is_empty() {
+    if should_run(CheckStage::Eslint) && !eslint_files.is_empty() {
         info!(stage = "eslint", files = eslint_files.len(), "Running");
         log_cmd(config.verbose, "./node_modules/.bin/eslint --fix --cache --cache-location .cache/eslint/ --quiet", &eslint_files);
         let mut result = checks::eslint::run(&eslint_files, project_dir).await?;
@@ -74,10 +80,10 @@ pub async fn run(
             result = run_fix_loop(CheckStage::Eslint, &eslint_files, &result.errors, config, project_dir).await?;
         }
         if !result.success {
+            log_stage_errors(CheckStage::Eslint, &result.errors);
             if config.no_fixes {
                 failed_stages.push((CheckStage::Eslint, result.errors));
             } else {
-                error!(branch = %branch.name, "ESLint errors remain after fix attempts");
                 return Ok(false);
             }
         } else {
@@ -87,7 +93,7 @@ pub async fn run(
 
     // Stage 3: TypeScript (full project, filter to changed files, Claude for fixes)
     let ts_files = files::filter_by_extensions(changed_files, files::TYPESCRIPT_EXTENSIONS);
-    if !ts_files.is_empty() {
+    if should_run(CheckStage::Typescript) && !ts_files.is_empty() {
         info!(stage = "tsc", files = ts_files.len(), "Running");
         log_cmd(config.verbose, "./node_modules/.bin/tsc --noEmit --pretty false", &[]);
         log_files(config.verbose, &ts_files);
@@ -96,10 +102,10 @@ pub async fn run(
             result = run_fix_loop(CheckStage::Typescript, &ts_files, &result.errors, config, project_dir).await?;
         }
         if !result.success {
+            log_stage_errors(CheckStage::Typescript, &result.errors);
             if config.no_fixes {
                 failed_stages.push((CheckStage::Typescript, result.errors));
             } else {
-                error!(branch = %branch.name, "TypeScript errors remain after fix attempts");
                 return Ok(false);
             }
         } else {
@@ -109,7 +115,7 @@ pub async fn run(
 
     // Stage 4: Vitest (update snapshots, Claude for failures)
     let test_files = files::collect_test_files(changed_files, project_dir);
-    if !test_files.is_empty() {
+    if should_run(CheckStage::Vitest) && !test_files.is_empty() {
         let snapshots = files::find_snapshot_files(&test_files, project_dir);
         if !snapshots.is_empty() {
             info!(stage = "vitest", snapshots = snapshots.len(), "Snapshots to update");
@@ -122,10 +128,10 @@ pub async fn run(
             result = run_fix_loop(CheckStage::Vitest, &test_files, &result.errors, config, project_dir).await?;
         }
         if !result.success {
+            log_stage_errors(CheckStage::Vitest, &result.errors);
             if config.no_fixes {
                 failed_stages.push((CheckStage::Vitest, result.errors));
             } else {
-                error!(branch = %branch.name, "Vitest failures remain after fix attempts");
                 return Ok(false);
             }
         } else {
@@ -133,26 +139,23 @@ pub async fn run(
         }
     }
 
-    // In --no-fixes mode, print all collected errors
+    // In --no-fixes mode, errors were already printed inline per stage
     if !failed_stages.is_empty() {
-        error!(branch = %branch.name, stages = failed_stages.len(), "Errors found (--no-fixes)");
-        for (stage, errors) in &failed_stages {
-            error!(stage = %stage, errors = errors.len(), "Failed");
-            for err in errors {
-                for line in err.lines() {
-                    error!(stage = %stage, "{}", line);
-                }
-            }
-        }
+        let stage_names: Vec<_> = failed_stages.iter().map(|(s, _)| s.to_string()).collect();
+        error!(branch = %ui::cyan(&branch.name), "Failed stages: {}", stage_names.join(", "));
         return Ok(false);
     }
 
     // All checks passed — commit
     if !config.no_commit {
-        commit_results(branch, &config.repo_path, &config.but_path).await?;
+        if config.use_git_commit {
+            git_commit_results(&config.repo_path).await?;
+        } else {
+            commit_results(branch, &config.repo_path, &config.but_path).await?;
+        }
     }
 
-    info!(branch = %branch.name, "Pipeline completed successfully");
+    info!(branch = %ui::cyan(&branch.name), "Pipeline completed successfully");
     Ok(true)
 }
 
@@ -231,14 +234,52 @@ async fn commit_results(
     if output.exit_code != 0 {
         let stderr = output.stderr.trim();
         if stderr.contains("No changes to commit") {
-            info!(branch = %branch.name, "All checks passed with no changes needed");
+            info!(branch = %ui::cyan(&branch.name), "All checks passed with no changes needed");
             return Ok(());
         }
         anyhow::bail!("but commit failed: {}", stderr);
     }
 
-    info!(branch = %branch.name, "Committed fixes");
+    info!(branch = %ui::cyan(&branch.name), "Committed fixes");
     Ok(())
+}
+
+async fn git_commit_results(repo_path: &Path) -> Result<()> {
+    // Stage all changes
+    let add_output = process::run_command("git", &["add", "-A"], repo_path).await?;
+    if add_output.exit_code != 0 {
+        anyhow::bail!("git add failed: {}", add_output.stderr.trim());
+    }
+
+    // Check if there's anything to commit
+    let status_output = process::run_command("git", &["diff", "--cached", "--quiet"], repo_path).await?;
+    if status_output.exit_code == 0 {
+        info!("All checks passed with no changes needed");
+        return Ok(());
+    }
+
+    let output = process::run_command(
+        "git",
+        &["commit", "-m", "tschecker: auto-fix prettier/lint/type/test issues"],
+        repo_path,
+    )
+    .await?;
+
+    if output.exit_code != 0 {
+        anyhow::bail!("git commit failed: {}", output.stderr.trim());
+    }
+
+    info!("Committed fixes via git");
+    Ok(())
+}
+
+fn log_stage_errors(stage: CheckStage, errors: &[String]) {
+    error!(stage = %stage, errors = errors.len(), "Failed");
+    for err in errors {
+        for line in err.lines() {
+            error!(stage = %stage, "{}", line);
+        }
+    }
 }
 
 fn log_cmd(verbose: bool, base_cmd: &str, files: &[String]) {
@@ -262,7 +303,7 @@ fn log_files(verbose: bool, files: &[String]) {
 }
 
 fn print_dry_run(branch: &gitbutler::Branch, changed_files: &[String], project_dir: &Path) {
-    println!("Branch: {} ({})", branch.name, branch.cli_id);
+    println!("Branch: {} ({})", ui::cyan(&branch.name), branch.cli_id);
     println!("Changed files ({}):", changed_files.len());
     for f in changed_files {
         println!("  {}", f);

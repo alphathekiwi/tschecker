@@ -5,6 +5,10 @@ use std::path::PathBuf;
 #[command(name = "tschecker")]
 #[command(about = "Run TypeScript checks on GitButler branch changes")]
 pub struct Cli {
+    /// Files to check directly (skips branch resolution, implies --no-fixes --no-commit)
+    #[arg(trailing_var_arg = true)]
+    pub files: Vec<String>,
+
     /// Check a specific branch by name or CLI ID
     #[arg(short, long)]
     pub branch: Option<String>,
@@ -22,7 +26,7 @@ pub struct Cli {
     pub project_dir: String,
 
     /// Max Claude fix attempts per check stage
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 1)]
     pub max_retries: u32,
 
     /// Path to the but CLI
@@ -48,6 +52,14 @@ pub struct Cli {
     /// Run as a post-commit hook (detect branch from last commit, run checks)
     #[arg(short, long)]
     pub post_commit: bool,
+
+    /// Run only a specific stage: prettier, eslint, tsc, vitest
+    #[arg(long)]
+    pub stage: Option<String>,
+
+    /// Base branch for merge-base when GitButler is not active (default: auto-detect main/master)
+    #[arg(long)]
+    pub base_branch: Option<String>,
 
     /// Rebuild and reinstall tschecker from source
     #[arg(long)]

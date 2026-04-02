@@ -19,24 +19,44 @@ async fn main() -> Result<()> {
         .compact()
         .init();
 
-    let cli = cli::Cli::parse();
+    let mut cli = cli::Cli::parse();
+
+    // Parse --stage early so we fail fast on invalid values
+    let stage_filter = cli.stage.as_deref()
+        .map(|s| s.parse::<checks::CheckStage>())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     if cli.update {
         return self_update().await;
     }
 
     if cli.post_commit {
-        return run_post_commit_mode(&cli).await;
+        return run_post_commit_mode(&cli, stage_filter).await;
+    }
+
+    // Direct file mode: tschecker file1.ts file2.tsx ...
+    if !cli.files.is_empty() {
+        return run_files_mode(&cli, stage_filter).await;
+    }
+
+    // No args at all (no files, no -b, no -a, no -p, no --update, no --dry-run):
+    // default to -a --no-fixes --no-commit
+    let no_args = cli.branch.is_none() && !cli.all && !cli.dry_run;
+    if no_args {
+        cli.all = true;
+        cli.no_fixes = true;
+        cli.no_commit = true;
     }
 
     let repo_path = cli.repo_path.canonicalize().context("Invalid repo path")?;
-    let project_dir = repo_path.join(&cli.project_dir);
+    let project_dir = resolve_project_dir(&repo_path, &cli.project_dir)?;
 
-    if !project_dir.exists() {
-        anyhow::bail!(
-            "Project directory not found: {}",
-            project_dir.display()
-        );
+    let gb_active = gitbutler::is_workspace_active(&repo_path).await;
+
+    if !gb_active && cli.all {
+        // GitButler not active — treat -a as "run on current branch"
+        return run_plain_git_mode(&cli, &repo_path, &project_dir, stage_filter).await;
     }
 
     info!("Fetching GitButler status...");
@@ -78,6 +98,8 @@ async fn main() -> Result<()> {
         no_fixes: cli.no_fixes,
         dry_run: cli.dry_run,
         verbose: cli.verbose,
+        use_git_commit: false,
+        stage: stage_filter,
     };
 
     let mut all_passed = true;
@@ -87,14 +109,14 @@ async fn main() -> Result<()> {
         let project_files = gitbutler::filter_to_project(&all_files, &cli.project_dir);
 
         if project_files.is_empty() {
-            info!(branch = %branch.name, "No files in {} — skipping", cli.project_dir);
+            info!(branch = %ui::cyan(&branch.name), "No files in {} — skipping", cli.project_dir);
             continue;
         }
 
         let passed = pipeline::run(branch, &project_files, &config).await?;
         if !passed {
             all_passed = false;
-            error!(branch = %branch.name, "Pipeline failed");
+            error!(branch = %ui::cyan(&branch.name), "Pipeline failed");
         }
     }
 
@@ -107,13 +129,120 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_post_commit_mode(cli: &cli::Cli) -> Result<()> {
+/// Direct file mode: tschecker file1.ts file2.tsx ...
+/// Skips branch resolution, expands to related test files, implies --no-fixes --no-commit
+async fn run_files_mode(cli: &cli::Cli, stage_filter: Option<checks::CheckStage>) -> Result<()> {
     let repo_path = cli.repo_path.canonicalize().context("Invalid repo path")?;
-    let project_dir = repo_path.join(&cli.project_dir);
+    let project_dir = resolve_project_dir(&repo_path, &cli.project_dir)?;
 
-    if !project_dir.exists() {
-        anyhow::bail!("Project directory not found: {}", project_dir.display());
+    // Expand the provided files to include related test files
+    let mut all_files: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for file in &cli.files {
+        if seen.insert(file.clone()) {
+            all_files.push(file.clone());
+        }
+        // Find related test file if this isn't already a test
+        if let Some(test_path) = files::find_test_file(file, &project_dir) {
+            let test_str = test_path.to_string_lossy().to_string();
+            if seen.insert(test_str.clone()) {
+                all_files.push(test_str);
+            }
+        }
     }
+
+    all_files.sort();
+
+    if all_files.is_empty() {
+        info!("No files to check");
+        return Ok(());
+    }
+
+    info!(files = all_files.len(), "Running on specified files");
+
+    let branch = gitbutler::Branch {
+        cli_id: "direct".to_string(),
+        name: "direct".to_string(),
+        commits: vec![],
+    };
+
+    let config = pipeline::PipelineConfig {
+        project_dir,
+        repo_path,
+        max_retries: cli.max_retries,
+        but_path: cli.but_path.clone(),
+        no_commit: true,
+        no_fixes: true,
+        dry_run: cli.dry_run,
+        verbose: cli.verbose,
+        use_git_commit: false,
+        stage: stage_filter,
+    };
+
+    let passed = pipeline::run(&branch, &all_files, &config).await?;
+
+    if passed {
+        info!("All checks passed");
+    } else {
+        error!("Checks failed");
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+async fn run_plain_git_mode(
+    cli: &cli::Cli,
+    repo_path: &std::path::Path,
+    project_dir: &std::path::Path,
+    stage_filter: Option<checks::CheckStage>,
+) -> Result<()> {
+    let branch_name = gitbutler::current_branch_name(repo_path).await?;
+    info!(branch = %ui::cyan(&branch_name), "GitButler not active, running on current branch");
+
+    let all_files = gitbutler::git_changed_files(repo_path, cli.base_branch.as_deref()).await?;
+    let project_files = gitbutler::filter_to_project(&all_files, &cli.project_dir);
+
+    if project_files.is_empty() {
+        info!(branch = %ui::cyan(&branch_name), "No changed files in {} — nothing to check", cli.project_dir);
+        return Ok(());
+    }
+
+    let branch = gitbutler::Branch {
+        cli_id: branch_name.clone(),
+        name: branch_name.clone(),
+        commits: vec![],
+    };
+
+    let config = pipeline::PipelineConfig {
+        project_dir: project_dir.to_path_buf(),
+        repo_path: repo_path.to_path_buf(),
+        max_retries: cli.max_retries,
+        but_path: cli.but_path.clone(),
+        no_commit: cli.no_commit,
+        no_fixes: cli.no_fixes,
+        dry_run: cli.dry_run,
+        verbose: cli.verbose,
+        use_git_commit: true,
+        stage: stage_filter,
+    };
+
+    let passed = pipeline::run(&branch, &project_files, &config).await?;
+
+    if passed {
+        info!(branch = %ui::cyan(&branch_name), "All checks passed");
+    } else {
+        error!(branch = %ui::cyan(&branch_name), "Pipeline failed");
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+async fn run_post_commit_mode(cli: &cli::Cli, stage_filter: Option<checks::CheckStage>) -> Result<()> {
+    let repo_path = cli.repo_path.canonicalize().context("Invalid repo path")?;
+    let project_dir = resolve_project_dir(&repo_path, &cli.project_dir)?;
 
     // Get the last real commit hash (skip GitButler's workspace merge commit)
     let log_output = process::run_command(
@@ -142,13 +271,13 @@ async fn run_post_commit_mode(cli: &cli::Cli) -> Result<()> {
         }
     };
 
-    info!(branch = %branch.name, "Detected branch from commit");
+    info!(branch = %ui::cyan(&branch.name), "Detected branch from commit");
 
     let all_files = gitbutler::branch_changed_files(&status, &branch.name);
     let project_files = gitbutler::filter_to_project(&all_files, &cli.project_dir);
 
     if project_files.is_empty() {
-        info!(branch = %branch.name, "No files in {} — skipping", cli.project_dir);
+        info!(branch = %ui::cyan(&branch.name), "No files in {} — skipping", cli.project_dir);
         return Ok(());
     }
 
@@ -161,17 +290,34 @@ async fn run_post_commit_mode(cli: &cli::Cli) -> Result<()> {
         no_fixes: cli.no_fixes,
         dry_run: cli.dry_run,
         verbose: cli.verbose,
+        use_git_commit: false,
+        stage: stage_filter,
     };
 
     let passed = pipeline::run(branch, &project_files, &config).await?;
 
     if !passed {
-        error!(branch = %branch.name, "Post-commit checks failed — manual fixes needed");
+        error!(branch = %ui::cyan(&branch.name), "Post-commit checks failed — manual fixes needed");
     } else {
-        info!(branch = %branch.name, "Post-commit checks passed");
+        info!(branch = %ui::cyan(&branch.name), "Post-commit checks passed");
     }
 
     Ok(())
+}
+
+/// Resolve the project directory, detecting if we're already inside it.
+/// If `repo_path` already ends with `project_dir`, use `repo_path` directly
+/// instead of appending the subdirectory again.
+fn resolve_project_dir(repo_path: &std::path::Path, project_dir: &str) -> Result<std::path::PathBuf> {
+    let joined = repo_path.join(project_dir);
+    if joined.exists() {
+        return Ok(joined);
+    }
+    // Check if repo_path itself ends with the project_dir component
+    if repo_path.ends_with(project_dir) && repo_path.exists() {
+        return Ok(repo_path.to_path_buf());
+    }
+    anyhow::bail!("Project directory not found: {}", joined.display());
 }
 
 async fn self_update() -> Result<()> {
@@ -198,8 +344,12 @@ async fn self_update() -> Result<()> {
     info!("Running: v{}  Source: v{}", running_version, source_version);
 
     if !is_newer(&source_version, running_version) {
-        info!("Already up to date");
-        return Ok(());
+        eprint!("Already up to date. Force reinstall? [y/N] ");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            return Ok(());
+        }
     }
 
     info!("Updating v{} -> v{}", running_version, source_version);

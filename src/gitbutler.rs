@@ -133,6 +133,95 @@ pub fn find_branch_by_commit<'a>(status: &'a ButStatus, commit_hash: &str) -> Op
     None
 }
 
+/// Check if GitButler workspace is active (HEAD points to gitbutler/workspace)
+pub async fn is_workspace_active(repo_path: &Path) -> bool {
+    let result = process::run_command(
+        "git",
+        &["symbolic-ref", "--short", "HEAD"],
+        repo_path,
+    )
+    .await;
+
+    match result {
+        Ok(output) => {
+            let head = output.stdout.trim();
+            head == "gitbutler/workspace"
+        }
+        Err(_) => false, // detached HEAD or other error
+    }
+}
+
+/// Get the current git branch name
+pub async fn current_branch_name(repo_path: &Path) -> Result<String> {
+    let output = process::run_command(
+        "git",
+        &["branch", "--show-current"],
+        repo_path,
+    )
+    .await?;
+    let name = output.stdout.trim().to_string();
+    if name.is_empty() {
+        anyhow::bail!("Not on any branch (detached HEAD?)");
+    }
+    Ok(name)
+}
+
+/// Get changed files on the current branch compared to its merge base with a base branch
+pub async fn git_changed_files(repo_path: &Path, base_branch: Option<&str>) -> Result<Vec<String>> {
+    let base = match base_branch {
+        Some(b) => b.to_string(),
+        None => find_base_branch(repo_path).await?,
+    };
+
+    // Get the merge base
+    let merge_base_output = process::run_command(
+        "git",
+        &["merge-base", &base, "HEAD"],
+        repo_path,
+    )
+    .await?;
+
+    let merge_base = merge_base_output.stdout.trim().to_string();
+    if merge_base.is_empty() {
+        anyhow::bail!("Could not find merge base with {}", base);
+    }
+
+    // Get changed files (committed + staged + unstaged)
+    let diff_output = process::run_command(
+        "git",
+        &["diff", "--name-only", &merge_base],
+        repo_path,
+    )
+    .await?;
+
+    let mut files: Vec<String> = diff_output
+        .stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+async fn find_base_branch(repo_path: &Path) -> Result<String> {
+    for candidate in &["main", "master"] {
+        let output = process::run_command(
+            "git",
+            &["rev-parse", "--verify", candidate],
+            repo_path,
+        )
+        .await;
+        if let Ok(o) = output {
+            if o.exit_code == 0 {
+                return Ok(candidate.to_string());
+            }
+        }
+    }
+    anyhow::bail!("Could not find main or master branch")
+}
+
 /// Filter file paths to a project subdirectory and make them relative to it
 pub fn filter_to_project(files: &[String], project_dir: &str) -> Vec<String> {
     let prefix = format!("{}/", project_dir.trim_end_matches('/'));

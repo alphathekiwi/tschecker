@@ -13,12 +13,25 @@ pub struct CheckResult {
     pub files_modified: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckStage {
     Prettier,
     Eslint,
     Typescript,
     Vitest,
+}
+
+impl std::str::FromStr for CheckStage {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "prettier" => Ok(Self::Prettier),
+            "eslint" => Ok(Self::Eslint),
+            "tsc" | "typescript" => Ok(Self::Typescript),
+            "vitest" | "test" => Ok(Self::Vitest),
+            _ => Err(format!("unknown stage '{}' (valid: prettier, eslint, tsc, vitest)", s)),
+        }
+    }
 }
 
 impl std::fmt::Display for CheckStage {

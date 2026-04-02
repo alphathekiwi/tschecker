@@ -3,6 +3,11 @@ use std::io::Write;
 
 use crate::gitbutler::Branch;
 
+/// Bold cyan ANSI wrapper for branch names in log output
+pub fn cyan(s: &str) -> String {
+    format!("\x1b[1;36m{}\x1b[0m", s)
+}
+
 /// Display branches and let user pick one with a single keypress.
 /// IDs: 0-9 for first 10, then a-z for 10-35.
 pub fn select_branch(branches: &[&Branch]) -> Result<usize> {
